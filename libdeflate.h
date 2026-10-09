@@ -41,13 +41,15 @@ struct libdeflate_options;
  * libdeflate_alloc_compressor() allocates a new compressor that supports
  * DEFLATE, zlib, and gzip compression.  'compression_level' is the compression
  * level on a zlib-like scale but with a higher maximum value (1 = fastest, 6 =
- * medium/default, 9 = slow, 12 = slowest).  Level 0 is also supported and means
+ * medium/default, 9 = slow, 12 = slowest).  Levels 13 and 14 (this fork, not
+ * part of libdeflate) compress further and take longer than level 12.
+ * Level 0 is also supported and means
  * "no compression", specifically "create a valid stream, but only emit
  * uncompressed blocks" (this will expand the data slightly).  Level -1 is an
  * alias indicating a default level of 6.
  *
  * The return value is a pointer to the new compressor, or NULL if out of memory
- * or if the compression level is invalid (i.e. outside the range [-1, 12]).
+ * or if the compression level is invalid (i.e. outside the range [-1, 14]).
  *
  * Note: for compression, the sliding window size is defined at compilation time
  * to 32768, the largest size permissible in the DEFLATE format.  It cannot be
