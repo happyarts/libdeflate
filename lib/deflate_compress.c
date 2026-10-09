@@ -164,16 +164,22 @@
  */
 #define MATCH_CACHE_LENGTH	(LONG_SOFT_MAX_BLOCK_LENGTH * 5)
 
-/* Levels 13-14: a split point is considered at most every this many bytes. */
-#define SPLIT_GRANULARITY	4096
+/*
+ * Levels 13-14: a split point is considered at most every this many bytes (at
+ * level 14 the finer one).
+ */
+#define SPLIT_GRANULARITY	1024
+#define FINE_SPLIT_GRANULARITY	512
+
+/* Levels 13-14: splitting in halves only looks at one split point in this many. */
+#define HALVING_STEP		4
 
 /*
  * Levels 13-14: after a match of nice_match_length, matches are still searched
  * at this many positions at each end of it (the others are skipped).
  */
 #define LONG_MATCH_SEARCH	8
-#define MAX_SPLIT_POINTS	\
-	((LONG_SOFT_MAX_BLOCK_LENGTH + MIN_BLOCK_LENGTH) / SPLIT_GRANULARITY + 3)
+#define MAX_SPLIT_POINTS	(MAX_BLOCK_LENGTH / FINE_SPLIT_GRANULARITY + 2)
 
 #endif /* SUPPORT_NEAR_OPTIMAL_PARSING */
 
@@ -678,23 +684,40 @@ struct libdeflate_compressor {
 			 * Levels 13-14: optimization passes over a whole block
 			 * before it is split by the cost of its chosen items;
 			 * each piece then gets max_optim_passes.  Nonzero also
-			 * selects fractional costs, longer blocks without the
-			 * block_split_stats heuristic, searches inside long
-			 * matches and smoothed codes.  0 for levels 10-12.
+			 * selects fractional costs that move on beyond each
+			 * change, a race against the literals' costs, longer
+			 * blocks without the block_split_stats heuristic,
+			 * searches inside long matches and smoothed codes.
+			 * 0 for levels 10-12.
 			 */
 			unsigned split_passes;
 
 			/* SOFT_MAX_BLOCK_LENGTH, or longer at level 14. */
 			u32 soft_max_block_length;
 
+			/* SPLIT_GRANULARITY, or finer at level 14. */
+			u32 split_granularity;
+
 			/* Split search: counts at the candidate split points. */
 			struct deflate_freqs split_freqs[MAX_SPLIT_POINTS];
 			u32 split_pos[MAX_SPLIT_POINTS];
 
-			/* The chosen split points, in order, and their cache ends. */
+			/*
+			 * The chosen pieces: the split point each one ends at,
+			 * in order, and its cache end.
+			 */
 			unsigned splits[MAX_SPLIT_POINTS];
 			const struct lz_match *split_cache_end[MAX_SPLIT_POINTS];
 			unsigned num_splits;
+
+			/*
+			 * Split search: the cost of each piece, of each piece
+			 * merged with the next one, and the merges in order.
+			 */
+			u32 piece_cost[MAX_SPLIT_POINTS];
+			u32 merged_cost[MAX_SPLIT_POINTS];
+			unsigned merges[MAX_SPLIT_POINTS];
+			unsigned halves[MAX_SPLIT_POINTS];
 
 		} n; /* (n)ear-optimal */
 	#endif /* SUPPORT_NEAR_OPTIMAL_PARSING */
@@ -3299,9 +3322,10 @@ deflate_adjust_costs_impl(struct libdeflate_compressor *c,
  * to reuse them instead of starting over with the default costs.  However, this
  * depends on how similar the new block is to the previous block.  Therefore,
  * use a heuristic to decide how similar the blocks are, and mix together the
- * current costs and the default costs accordingly.
+ * current costs and the default costs accordingly.  Returns true if the default
+ * costs got more weight than the current ones.
  */
-static void
+static bool
 deflate_adjust_costs(struct libdeflate_compressor *c,
 		     u32 lit_cost, u32 len_sym_cost)
 {
@@ -3341,9 +3365,15 @@ deflate_adjust_costs(struct libdeflate_compressor *c,
 		deflate_adjust_costs_impl(c, lit_cost, len_sym_cost, 1);
 	else
 		deflate_adjust_costs_impl(c, lit_cost, len_sym_cost, 0);
+
+	return 2 * total_delta > 3 * cutoff;
 }
 
-static void
+/*
+ * Returns true if the costs are the default ones or mostly made of them, false
+ * if they are mostly the previous block's.
+ */
+static bool
 deflate_set_initial_costs(struct libdeflate_compressor *c,
 			  const u8 *block_begin, u32 block_length,
 			  bool is_first_block)
@@ -3352,10 +3382,11 @@ deflate_set_initial_costs(struct libdeflate_compressor *c,
 
 	deflate_choose_default_litlen_costs(c, block_begin, block_length,
 					    &lit_cost, &len_sym_cost);
-	if (is_first_block)
+	if (is_first_block) {
 		deflate_set_default_costs(c, lit_cost, len_sym_cost);
-	else
-		deflate_adjust_costs(c, lit_cost, len_sym_cost);
+		return true;
+	}
+	return deflate_adjust_costs(c, lit_cost, len_sym_cost);
 }
 
 /*
@@ -3516,6 +3547,35 @@ deflate_set_costs_from_freqs(struct libdeflate_compressor *c,
 }
 
 /*
+ * Levels 13-14: set the costs from symbol frequencies, then move each one on by
+ * three quarters of its change since the last pass.  From one pass to the next
+ * the costs approach the ones they would settle at only slowly; going beyond
+ * the change gets there in fewer passes.
+ */
+static void
+deflate_update_costs_from_freqs(struct libdeflate_compressor *c,
+				const struct deflate_freqs *freqs)
+{
+	const struct deflate_costs prev = c->p.n.costs;
+	unsigned i;
+
+	deflate_set_costs_from_freqs(c, freqs);
+#define OVERSHOOT(cost, prev_cost)					\
+	do {								\
+		s32 v = (s32)(cost) + ((s32)(cost) - (s32)(prev_cost)) *	\
+			3 / 4;						\
+		(cost) = v < 1 ? 1 : v;					\
+	} while (0)
+	for (i = 0; i < DEFLATE_NUM_LITERALS; i++)
+		OVERSHOOT(c->p.n.costs.literal[i], prev.literal[i]);
+	for (i = DEFLATE_MIN_MATCH_LEN; i <= DEFLATE_MAX_MATCH_LEN; i++)
+		OVERSHOOT(c->p.n.costs.length[i], prev.length[i]);
+	for (i = 0; i < ARRAY_LEN(deflate_offset_slot_base); i++)
+		OVERSHOOT(c->p.n.costs.offset_slot[i], prev.offset_slot[i]);
+#undef OVERSHOOT
+}
+
+/*
  * Choose the literals and matches for the current block.
  *
  * To choose the literal/match sequence, we find the minimum-cost path through
@@ -3608,7 +3668,7 @@ deflate_optimize_block(struct libdeflate_compressor *c,
 
 		/* Update the cost model from the Huffman codes. */
 		if (c->p.n.split_passes)
-			deflate_set_costs_from_freqs(c, &c->freqs);
+			deflate_update_costs_from_freqs(c, &c->freqs);
 		else
 			deflate_set_costs_from_codes(c, &c->codes.lens);
 
@@ -3766,32 +3826,40 @@ deflate_freqs_between(const struct libdeflate_compressor *c, unsigned a,
 	freqs->litlen[DEFLATE_END_OF_BLOCK] = 1;
 }
 
+/* The cost of one dynamic block with the items between split points @a, @b. */
+static u32
+deflate_cost_between(struct libdeflate_compressor *c, unsigned a, unsigned b)
+{
+	deflate_freqs_between(c, a, b, &c->freqs);
+	return deflate_dynamic_block_cost(c);
+}
+
 /*
- * Append to c->p.n.splits, in order, the split point between @a and @b that
- * makes the two blocks cheapest, if they are cheaper than @cost, the cost of
- * one block; then the same for both halves (zopfli's block splitting, on exact
- * costs).  Uses c->freqs and c->codes as scratch space.
+ * Append to c->p.n.halves, in order, the split point between @a and @b (one
+ * in every HALVING_STEP) that makes the two pieces cheapest, if they are
+ * cheaper than @cost, the cost of one; then the same for both halves.
+ * Returns the cost of the pieces.  Uses c->freqs and c->codes as scratch space.
  */
-static void
-deflate_choose_splits(struct libdeflate_compressor *c, unsigned a, unsigned b,
-		      u32 cost)
+static u64
+deflate_halve(struct libdeflate_compressor *c, unsigned a, unsigned b,
+	      u32 cost, unsigned *num_halves)
 {
 	const u32 *pos = c->p.n.split_pos;
 	u32 best_cost = cost, best_left = 0, best_right = 0;
 	unsigned best = 0, k;
+	u64 total;
 
 	for (k = a + 1; k < b; k++) {
 		u32 left, right;
 
-		if (pos[k] - pos[a] < MIN_BLOCK_LENGTH ||
+		if (k % HALVING_STEP != 0 ||
+		    pos[k] - pos[a] < MIN_BLOCK_LENGTH ||
 		    pos[b] - pos[k] < MIN_BLOCK_LENGTH)
 			continue;
-		deflate_freqs_between(c, a, k, &c->freqs);
-		left = deflate_dynamic_block_cost(c);
+		left = deflate_cost_between(c, a, k);
 		if (left >= best_cost)
 			continue;
-		deflate_freqs_between(c, k, b, &c->freqs);
-		right = deflate_dynamic_block_cost(c);
+		right = deflate_cost_between(c, k, b);
 		if (left + right < best_cost) {
 			best_cost = left + right;
 			best_left = left;
@@ -3800,10 +3868,169 @@ deflate_choose_splits(struct libdeflate_compressor *c, unsigned a, unsigned b,
 		}
 	}
 	if (best == 0)
+		return cost;
+	total = deflate_halve(c, a, best, best_left, num_halves);
+	c->p.n.halves[(*num_halves)++] = best;
+	return total + deflate_halve(c, best, b, best_right, num_halves);
+}
+
+/*
+ * Choose pieces of the block between split points 0 and @n.  Start with one
+ * piece between every two neighbouring split points and merge neighbouring
+ * pieces until one is left: always the two whose merge saves the most bits (or
+ * costs the fewest), except that while no merge saves anything, pieces shorter
+ * than MIN_BLOCK_LENGTH are merged first.  Of all the steps without a piece
+ * that is too short, keep the cheapest, or the pieces from deflate_halve() if
+ * they are cheaper.  Unlike splitting in halves, merging also finds the
+ * boundaries of sections that alternate, where no single split into two
+ * halves would pay off.  Sets c->p.n.splits to the split point each piece ends
+ * at (the last one is @n) and c->p.n.num_splits to the number of pieces.  Uses
+ * c->freqs and c->codes as scratch space.
+ */
+static void
+deflate_choose_splits(struct libdeflate_compressor *c, unsigned n)
+{
+	unsigned *end = c->p.n.splits;
+	u32 *cost = c->p.n.piece_cost;
+	u32 *merged = c->p.n.merged_cost;
+	const u32 *pos = c->p.n.split_pos;
+	unsigned m = n, num_short = 0, step = 0, best_step = 0;
+	u64 total = 0, best_total = UINT64_MAX;
+	unsigned i, best;
+
+#define PIECE_IS_SHORT(i)	\
+	(pos[end[i]] - ((i) ? pos[end[(i) - 1]] : 0) < MIN_BLOCK_LENGTH)
+
+	for (i = 0; i < n; i++) {
+		end[i] = i + 1;
+		cost[i] = deflate_cost_between(c, i, i + 1);
+		total += cost[i];
+		num_short += PIECE_IS_SHORT(i);
+	}
+	for (i = 0; i + 1 < n; i++)
+		merged[i] = deflate_cost_between(c, i, i + 2);
+	if (num_short == 0)
+		best_total = total;
+
+	while (m > 1) {
+		s64 best_gain = INT64_MIN;
+
+		best = 0;
+		for (i = 0; i + 1 < m; i++) {
+			s64 gain = (s64)cost[i] + cost[i + 1] - merged[i];
+
+			if (gain > best_gain) {
+				best_gain = gain;
+				best = i;
+			}
+		}
+		if (best_gain <= 0 && num_short != 0) {
+			best_gain = INT64_MIN;
+			for (i = 0; i + 1 < m; i++) {
+				s64 gain = (s64)cost[i] + cost[i + 1] -
+					   merged[i];
+
+				if (gain > best_gain &&
+				    (PIECE_IS_SHORT(i) ||
+				     PIECE_IS_SHORT(i + 1))) {
+					best_gain = gain;
+					best = i;
+				}
+			}
+		}
+
+		/* Merge pieces @best and @best + 1. */
+		num_short -= PIECE_IS_SHORT(best) + PIECE_IS_SHORT(best + 1);
+		total -= best_gain;
+		cost[best] = merged[best];
+		end[best] = end[best + 1];
+		m--;
+		for (i = best + 1; i < m; i++) {
+			end[i] = end[i + 1];
+			cost[i] = cost[i + 1];
+			merged[i] = merged[i + 1];
+		}
+		num_short += PIECE_IS_SHORT(best);
+		if (best > 0)
+			merged[best - 1] = deflate_cost_between(c,
+					best > 1 ? end[best - 2] : 0, end[best]);
+		if (best + 1 < m)
+			merged[best] = deflate_cost_between(c,
+					best > 0 ? end[best - 1] : 0,
+					end[best + 1]);
+		c->p.n.merges[step++] = best;
+		if (num_short == 0 && total < best_total) {
+			best_total = total;
+			best_step = step;
+		}
+	}
+#undef PIECE_IS_SHORT
+
+	/* Splitting in halves sometimes finds cheaper pieces; then use those. */
+	m = 0;
+	if (deflate_halve(c, 0, n, deflate_cost_between(c, 0, n), &m) <
+	    best_total) {
+		for (i = 0; i < m; i++)
+			end[i] = c->p.n.halves[i];
+		end[m++] = n;
+		c->p.n.num_splits = m;
 		return;
-	deflate_choose_splits(c, a, best, best_left);
-	c->p.n.splits[c->p.n.num_splits++] = best;
-	deflate_choose_splits(c, best, b, best_right);
+	}
+
+	/* Redo the merges up to the cheapest step. */
+	for (i = 0; i < n; i++)
+		end[i] = i + 1;
+	m = n;
+	for (step = 0; step < best_step; step++) {
+		best = c->p.n.merges[step];
+		m--;
+		for (i = best; i < m; i++)
+			end[i] = end[i + 1];
+	}
+	c->p.n.num_splits = m;
+}
+
+/*
+ * Levels 13-14: optimize the block from the costs that are set; but if those are
+ * default costs (@fresh), first let them race against the costs of the block's
+ * literals alone.  Where the passes end up depends on where they start: in
+ * noisy data such as photos, from default costs they can settle on many short
+ * matches although more literals would be smaller, and in other data the
+ * other way round.  The default costs get one pass, the literals' costs two
+ * (from there the first pass finds hardly any matches); the cheaper path
+ * goes on with the remaining passes.
+ */
+static bool
+deflate_optimize_block_raced(struct libdeflate_compressor *c,
+			     const u8 *block_begin, u32 block_length,
+			     const struct lz_match *cache_ptr,
+			     unsigned num_passes, bool fresh)
+{
+	struct deflate_costs costs;
+	u32 cost;
+	bool only_literals;
+
+	if (fresh && num_passes >= 2) {
+		deflate_optimize_block(c, block_begin, block_length, cache_ptr,
+				       1);
+		cost = deflate_compute_true_cost(c);
+		costs = c->p.n.costs;
+
+		deflate_choose_all_literals(c, block_begin, block_length);
+		deflate_set_costs_from_freqs(c, &c->freqs);
+		only_literals = deflate_optimize_block(c, block_begin,
+				block_length, cache_ptr, 2);
+		if (deflate_compute_true_cost(c) < cost) {
+			if (num_passes == 2)
+				return only_literals;
+			num_passes -= 2;
+		} else {
+			c->p.n.costs = costs;
+			num_passes -= 1;
+		}
+	}
+	return deflate_optimize_block(c, block_begin, block_length, cache_ptr,
+				      num_passes);
 }
 
 /*
@@ -3827,16 +4054,18 @@ deflate_split_and_flush(struct libdeflate_compressor *c,
 	struct deflate_codes block_codes;
 	unsigned n, i, prev;
 	u32 pos;
+	bool fresh;
 
-	deflate_set_initial_costs(c, block_begin, block_length, is_first_block);
-	*used_only_literals = deflate_optimize_block(c, block_begin,
-			block_length, cache_ptr, c->p.n.split_passes);
+	fresh = deflate_set_initial_costs(c, block_begin, block_length,
+					  is_first_block);
+	*used_only_literals = deflate_optimize_block_raced(c, block_begin,
+			block_length, cache_ptr, c->p.n.split_passes, fresh);
 	block_freqs = c->freqs;
 	block_codes = c->codes;
 
 	/*
 	 * Candidate split points: the first item boundary at least
-	 * SPLIT_GRANULARITY bytes after the previous one, with the counts of
+	 * split_granularity bytes after the previous one, with the counts of
 	 * all symbols before it.  (If only literals won, the path is still a
 	 * valid one from the last pass.)
 	 */
@@ -3848,7 +4077,7 @@ deflate_split_and_flush(struct libdeflate_compressor *c,
 	do {
 		u32 at = node - c->p.n.optimum_nodes;
 
-		if (at - pos >= SPLIT_GRANULARITY) {
+		if (at - pos >= c->p.n.split_granularity) {
 			c->p.n.split_freqs[n] = freqs;
 			c->p.n.split_pos[n++] = at;
 			pos = at;
@@ -3858,12 +4087,10 @@ deflate_split_and_flush(struct libdeflate_compressor *c,
 	c->p.n.split_freqs[n] = freqs;
 	c->p.n.split_pos[n] = block_length;
 
-	c->p.n.num_splits = 0;
-	deflate_freqs_between(c, 0, n, &c->freqs);
-	deflate_choose_splits(c, 0, n, deflate_dynamic_block_cost(c));
+	deflate_choose_splits(c, n);
 
 	/* Without a split, the whole-block result is output as it is. */
-	if (c->p.n.num_splits == 0) {
+	if (c->p.n.num_splits == 1) {
 		c->freqs = block_freqs;
 		c->codes = block_codes;
 		deflate_flush_optimized_block(c, os, block_begin, block_length,
@@ -3871,7 +4098,6 @@ deflate_split_and_flush(struct libdeflate_compressor *c,
 					      is_final_block);
 		return;
 	}
-	c->p.n.splits[c->p.n.num_splits++] = n;
 
 	/* The end of the match cache at each split point, from the back. */
 	i = c->p.n.num_splits - 1;
@@ -3917,6 +4143,8 @@ deflate_optimize_and_flush_block(struct libdeflate_compressor *c,
 				 bool is_first_block, bool is_final_block,
 				 bool *used_only_literals)
 {
+	bool fresh;
+
 	if (c->p.n.split_passes != 0 && block_length >= 2 * MIN_BLOCK_LENGTH) {
 		deflate_split_and_flush(c, os, block_begin, block_length,
 					cache_ptr, is_first_block,
@@ -3924,9 +4152,16 @@ deflate_optimize_and_flush_block(struct libdeflate_compressor *c,
 		return;
 	}
 	/* Initialize c->p.n.costs with default costs. */
-	deflate_set_initial_costs(c, block_begin, block_length, is_first_block);
-	*used_only_literals = deflate_optimize_block(c, block_begin,
-			block_length, cache_ptr, c->p.n.max_optim_passes);
+	fresh = deflate_set_initial_costs(c, block_begin, block_length,
+					  is_first_block);
+	if (c->p.n.split_passes != 0)
+		*used_only_literals = deflate_optimize_block_raced(c,
+				block_begin, block_length, cache_ptr,
+				c->p.n.max_optim_passes, fresh);
+	else
+		*used_only_literals = deflate_optimize_block(c, block_begin,
+				block_length, cache_ptr,
+				c->p.n.max_optim_passes);
 	deflate_flush_optimized_block(c, os, block_begin, block_length,
 				      *used_only_literals, is_final_block);
 }
@@ -4455,19 +4690,21 @@ libdeflate_alloc_compressor_ex(int compression_level,
 	/*
 	 * Levels 13-14 are level 12 plus cost-based block splitting (see
 	 * deflate_split_and_flush()).  13 optimizes a block and its pieces with
-	 * fewer passes; 14 uses all of them and longer blocks.
+	 * few passes; 14 uses more of them, longer blocks and finer splits.
 	 */
 	if (compression_level >= 10) {
 		c->p.n.split_passes = 0;
 		c->p.n.soft_max_block_length = SOFT_MAX_BLOCK_LENGTH;
+		c->p.n.split_granularity = SPLIT_GRANULARITY;
 	}
 	if (compression_level == 13) {
-		c->p.n.split_passes = 3;
+		c->p.n.split_passes = 2;
 		c->p.n.max_optim_passes = 4;
 	}
 	if (compression_level == 14) {
-		c->p.n.split_passes = 10;
+		c->p.n.split_passes = 5;
 		c->p.n.soft_max_block_length = LONG_SOFT_MAX_BLOCK_LENGTH;
+		c->p.n.split_granularity = FINE_SPLIT_GRANULARITY;
 	}
 #endif
 
