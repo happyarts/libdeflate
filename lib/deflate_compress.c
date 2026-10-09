@@ -4698,7 +4698,7 @@ libdeflate_alloc_compressor_ex(int compression_level,
 		c->p.n.split_granularity = SPLIT_GRANULARITY;
 	}
 	if (compression_level == 13) {
-		c->p.n.split_passes = 2;
+		c->p.n.split_passes = 3;
 		c->p.n.max_optim_passes = 4;
 	}
 	if (compression_level == 14) {
