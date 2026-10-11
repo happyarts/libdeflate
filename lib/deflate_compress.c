@@ -4254,7 +4254,10 @@ deflate_compress_near_optimal(struct libdeflate_compressor * restrict c,
 	bt_matchfinder_init(&c->p.n.bt_mf);
 	deflate_near_optimal_init_stats(c);
 
-	/* The bytes before the input go into the matchfinder, unwritten. */
+	/*
+	 * The bytes before the input go into the matchfinder, unwritten, as
+	 * the bytes a long match covers do below.
+	 */
 	if (c->dict_nbytes != 0) {
 		const u8 *d = in - c->dict_nbytes;
 
