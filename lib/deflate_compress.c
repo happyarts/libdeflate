@@ -488,6 +488,14 @@ struct libdeflate_compressor {
 	/* The compression level with which this compressor was created */
 	unsigned compression_level;
 
+	/*
+	 * For libdeflate_deflate_compress_part(): the bytes before the input
+	 * that matches may refer to, and whether more of the stream follows
+	 * (then no block is the final one).
+	 */
+	size_t dict_nbytes;
+	bool more_follows;
+
 	/* Anything of this size or less we won't bother trying to compress. */
 	size_t max_passthrough_size;
 
@@ -4246,6 +4254,24 @@ deflate_compress_near_optimal(struct libdeflate_compressor * restrict c,
 	bt_matchfinder_init(&c->p.n.bt_mf);
 	deflate_near_optimal_init_stats(c);
 
+	/* The bytes before the input go into the matchfinder, unwritten. */
+	if (c->dict_nbytes != 0) {
+		const u8 *d = in - c->dict_nbytes;
+
+		in_cur_base = d;
+		in_next_slide = d + MIN(in_end - d, MATCHFINDER_WINDOW_SIZE);
+		for (; d < in; d++) {
+			adjust_max_and_nice_len(&max_len, &nice_len, in_end - d);
+			if (max_len >= BT_MATCHFINDER_REQUIRED_NBYTES)
+				bt_matchfinder_skip_byte(&c->p.n.bt_mf,
+							 in_cur_base,
+							 d - in_cur_base,
+							 nice_len,
+							 c->max_search_depth,
+							 next_hashes);
+		}
+	}
+
 	do {
 		/* Starting a new DEFLATE block */
 		const u8 * const in_max_block_end = choose_max_block_end(
@@ -4505,7 +4531,7 @@ deflate_compress_near_optimal(struct libdeflate_compressor * restrict c,
 			 */
 			u32 block_length = in_next - in_block_begin;
 			bool is_first = (in_block_begin == in);
-			bool is_final = (in_next == in_end);
+			bool is_final = (in_next == in_end) && !c->more_follows;
 
 			deflate_near_optimal_merge_stats(c);
 			deflate_optimize_and_flush_block(
@@ -4590,6 +4616,8 @@ libdeflate_alloc_compressor_ex(int compression_level,
 		       options->free_func : libdeflate_default_free_func;
 
 	c->compression_level = compression_level;
+	c->dict_nbytes = 0;
+	c->more_follows = false;
 
 	/*
 	 * The higher the compression level, the more we should bother trying to
@@ -4778,6 +4806,65 @@ unsigned int
 libdeflate_get_compression_level(struct libdeflate_compressor *c)
 {
 	return c->compression_level;
+}
+
+LIBDEFLATEAPI size_t
+libdeflate_deflate_compress_part(struct libdeflate_compressor *c,
+				 const void *in, size_t in_nbytes,
+				 size_t dict_nbytes, int final,
+				 void *out, size_t out_nbytes_avail)
+{
+#if SUPPORT_NEAR_OPTIMAL_PARSING
+	struct deflate_output_bitstream os;
+
+	if (c->impl != deflate_compress_near_optimal ||
+	    dict_nbytes > MATCHFINDER_WINDOW_SIZE ||
+	    in_nbytes <= c->max_passthrough_size)
+		return 0;
+
+	os.bitbuf = 0;
+	os.bitcount = 0;
+	os.next = out;
+	os.end = os.next + out_nbytes_avail;
+	os.overflow = false;
+
+	c->dict_nbytes = dict_nbytes;
+	c->more_follows = !final;
+	(*c->impl)(c, in, in_nbytes, &os);
+	c->dict_nbytes = 0;
+	c->more_follows = false;
+	if (os.overflow)
+		return 0;
+
+	ASSERT(os.bitcount <= 7);
+	if (!final) {
+		/*
+		 * An empty stored block (BFINAL 0, BTYPE 00, then LEN 0 and
+		 * NLEN 0xFFFF from the next byte boundary) ends the part on a
+		 * byte boundary, as a sync flush does.
+		 */
+		unsigned nbytes = (os.bitcount + 3 + 7) / 8;
+
+		if ((size_t)(os.end - os.next) < nbytes + 4)
+			return 0;
+		while (nbytes--) {
+			*os.next++ = (u8)os.bitbuf;
+			os.bitbuf >>= 8;
+		}
+		*os.next++ = 0x00;
+		*os.next++ = 0x00;
+		*os.next++ = 0xFF;
+		*os.next++ = 0xFF;
+	} else if (os.bitcount) {
+		ASSERT(os.next < os.end);
+		*os.next++ = os.bitbuf;
+	}
+	return os.next - (u8 *)out;
+#else
+	(void)c; (void)in; (void)in_nbytes; (void)dict_nbytes; (void)final;
+	(void)out; (void)out_nbytes_avail;
+	return 0;
+#endif
 }
 
 LIBDEFLATEAPI size_t

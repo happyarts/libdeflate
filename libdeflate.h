@@ -90,6 +90,22 @@ libdeflate_deflate_compress(struct libdeflate_compressor *compressor,
 			    void *out, size_t out_nbytes_avail);
 
 /*
+ * libdeflate_deflate_compress_part() compresses one part of a longer DEFLATE
+ * stream, so the parts can be compressed at the same time: the
+ * 'dict_nbytes' bytes before 'in' (at most 32768) are the data before the
+ * part, which matches may refer to; 'final' says whether the part is the
+ * stream's last. A part that isn't the last ends on a byte boundary with an
+ * empty stored block (as a sync flush does), so the parts written one after
+ * another are one DEFLATE stream. Only for compression levels 10 and above:
+ * for others it returns 0, as it does when the output doesn't fit.
+ */
+LIBDEFLATEAPI size_t
+libdeflate_deflate_compress_part(struct libdeflate_compressor *compressor,
+				 const void *in, size_t in_nbytes,
+				 size_t dict_nbytes, int final,
+				 void *out, size_t out_nbytes_avail);
+
+/*
  * libdeflate_deflate_compress_bound() returns a worst-case upper bound on the
  * number of bytes of compressed data that may be produced by compressing any
  * buffer of length less than or equal to 'in_nbytes' using
